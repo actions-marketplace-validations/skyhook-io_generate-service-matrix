@@ -30547,11 +30547,123 @@ module.exports = { buildBuildMatrix };
 
 /***/ }),
 
+/***/ 5280:
+/***/ ((module) => {
+
+/**
+ * Build a service-scoped image tag that fits within max_length, with the
+ * service prefix and per-service counter suffix protected (never truncated).
+ *
+ * The opaque `tag` middle (which typically encodes branch + date + outer counter
+ * from an upstream determine-image-tag run) is the elastic component. If the
+ * concatenation overflows, we slice `tag` from the right and strip any trailing
+ * '-' / '_' so the result never ends in a separator.
+ *
+ * Invariants mirror those of skyhook-io/determine-image-tag's auto-generation
+ * path (see PR https://github.com/skyhook-io/determine-image-tag/pull/2):
+ *   1. Service prefix and counter suffix are protected.
+ *   2. The middle part is elastic.
+ *   3. Trim trailing '-' / '_' after every truncation.
+ *   4. Drop empty parts so the join never emits adjacent separators.
+ *   5. Final length <= maxLength.
+ *
+ * @param {string} serviceName - Service name prefix.
+ * @param {string} tag - Opaque tag middle (e.g. "<branch>_<date>_<NN>").
+ * @param {string} counterStr - Two-digit (or wider) per-service counter, no leading '_'.
+ * @param {number} [maxLength=63] - Maximum total length. Default matches the K8s
+ *   label limit. Raise to 128 if only used in image tag / GitHub release names.
+ * @returns {string}
+ */
+function buildServiceTag(serviceName, tag, counterStr, maxLength = 63) {
+  if (typeof maxLength !== 'number' || !Number.isFinite(maxLength) || maxLength <= 0) {
+    throw new Error(`buildServiceTag: maxLength must be a positive integer, got ${maxLength}`);
+  }
+
+  const svc = String(serviceName || '');
+  const cnt = String(counterStr || '');
+  const mid = String(tag || '');
+
+  // Fixed parts: <svc><_><mid><_><cnt>. Separators count only when the parts they
+  // join are non-empty -- we compute the budget conservatively, then build by
+  // joining only non-empty parts so unused separators evaporate.
+  const fixedSepCount = (svc ? 1 : 0) + (cnt ? 1 : 0);
+  const fixedLen = svc.length + cnt.length + fixedSepCount;
+
+  if (fixedLen > maxLength) {
+    // Service + counter alone overflow. Best-effort: truncate service so cnt fits.
+    const availSvc = Math.max(0, maxLength - cnt.length - (cnt ? 1 : 0));
+    const truncatedSvc = trimTrailingSep(svc.slice(0, availSvc));
+    return joinNonEmpty('_', [truncatedSvc, cnt]);
+  }
+
+  const availForTag = maxLength - fixedLen;
+  let truncatedTag = mid;
+  if (availForTag <= 0) {
+    truncatedTag = '';
+  } else if (mid.length > availForTag) {
+    truncatedTag = trimTrailingSep(mid.slice(0, availForTag));
+  }
+
+  return joinNonEmpty('_', [svc, truncatedTag, cnt]);
+}
+
+/**
+ * Strip trailing '-' and '_' characters.
+ * @param {string} s
+ * @returns {string}
+ */
+function trimTrailingSep(s) {
+  return String(s || '').replace(/[-_]+$/, '');
+}
+
+/**
+ * Join non-empty string parts with a separator. Skips empty/falsy entries so
+ * the result never has adjacent separators or leading/trailing separators
+ * caused by empty middle parts.
+ * @param {string} sep
+ * @param {Array<string>} parts
+ * @returns {string}
+ */
+function joinNonEmpty(sep, parts) {
+  return (parts || []).filter(p => p !== undefined && p !== null && p !== '').join(sep);
+}
+
+/**
+ * Build the prefix of a service_tag — the portion before the final "_<counter>".
+ * Used when scanning existing git tags to find prior counters: callers must
+ * search using the SAME truncation rules that buildServiceTag applies when
+ * minting new tags, otherwise truncated tags from prior runs are missed and
+ * the counter resets, causing collisions.
+ *
+ * @param {string} serviceName
+ * @param {string} tag
+ * @param {number} [maxLength=63]
+ * @param {number} [counterDigits=2] - Counter width to reserve in the budget.
+ * @returns {string}
+ */
+function buildServiceTagPrefix(serviceName, tag, maxLength = 63, counterDigits = 2) {
+  const placeholder = '0'.repeat(Math.max(1, counterDigits));
+  const sample = buildServiceTag(serviceName, tag, placeholder, maxLength);
+  // Strip the trailing "_<digits>" we just appended.
+  return sample.replace(/_\d+$/, '');
+}
+
+module.exports = {
+  buildServiceTag,
+  buildServiceTagPrefix,
+  trimTrailingSep,
+  joinNonEmpty,
+};
+
+
+/***/ }),
+
 /***/ 6104:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const core = __nccwpck_require__(7484);
 const { DeploymentMatrix, DeploymentEntry } = __nccwpck_require__(9439);
+const { buildServiceTag } = __nccwpck_require__(5280);
 
 /**
  * Build a DeploymentMatrix from Skyhook services and environments
@@ -30560,14 +30672,18 @@ const { DeploymentMatrix, DeploymentEntry } = __nccwpck_require__(9439);
  * @param {Object} options - Build options
  * @param {string} options.tag - Image tag to inject
  * @param {string} options.serviceRepo - Source repository (e.g., "KoalaOps/orbit")
- * @param {string} [options.envFilter] - Environment filter (optional)
+ * @param {Set<string>|null} [options.envFilterSet] - Environment filter as a set of names. null/empty = no filter.
  * @param {Map<string, number>} [options.serviceCounters] - Per-service counters from Koala
  * @param {Map<string, Array>} [options.perServiceEnvs] - Per-service environments from deployment repos
+ * @param {boolean} [options.forceDeploy] - When true, auto_deploy is set to 'true' on every surviving entry regardless of env.autoDeploy
  * @returns {DeploymentMatrix}
  */
 function buildMatrixFromSkyhook(services, environments, options = {}) {
-  const { tag, serviceRepo, envFilter, serviceCounters = new Map(), perServiceEnvs = new Map() } = options;
+  const { tag, serviceRepo, envFilterSet, serviceCounters = new Map(), perServiceEnvs = new Map(), forceDeploy = false, maxLength = 63 } = options;
   const matrix = new DeploymentMatrix();
+
+  // null/empty set means no filter (include all envs).
+  const effectiveFilter = (envFilterSet instanceof Set && envFilterSet.size > 0) ? envFilterSet : null;
 
   // Clone the counters map so we can modify it
   const counters = new Map(serviceCounters);
@@ -30576,6 +30692,8 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
   core.info(`   - Tag: ${tag}`);
   core.info(`   - Service repo (from GITHUB_REPOSITORY): ${serviceRepo}`);
   core.info(`   - Existing service counters: ${JSON.stringify(Object.fromEntries(counters))}`);
+  core.info(`   - Env filter: ${effectiveFilter ? `[${[...effectiveFilter].join(', ')}]` : '(none)'}`);
+  core.info(`   - force-deploy: ${forceDeploy}`);
 
   core.info(`   - Services count: ${services.length}`);
 
@@ -30588,8 +30706,8 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
     let serviceEnvs = perServiceEnvs.has(service.name) ? perServiceEnvs.get(service.name) : environments;
 
     // Apply environment filter if provided
-    if (envFilter) {
-      serviceEnvs = serviceEnvs.filter(env => env.name === envFilter);
+    if (effectiveFilter) {
+      serviceEnvs = serviceEnvs.filter(env => effectiveFilter.has(env.name));
     }
 
     core.info(`   - ${service.name}: ${serviceEnvs.length} environments${perServiceEnvs.has(service.name) ? ' (from deployment repo)' : ' (from local config)'}`);
@@ -30599,12 +30717,19 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
     const nextCounter = currentCounter + 1;
     counters.set(service.name, nextCounter);
     const counterStr = String(nextCounter).padStart(2, '0');
-    const serviceTag = `${service.name}_${tag}_${counterStr}`;
+    // Length-aware composition: protects service prefix and counter suffix,
+    // trims the elastic tag middle so the final tag fits within maxLength
+    // (default 63 = K8s label limit) without trailing or double separators.
+    // See src/matrix/build-service-tag.js for the invariants.
+    const serviceTag = buildServiceTag(service.name, tag, counterStr, maxLength);
+    if (serviceTag.length === maxLength && `${service.name}_${tag}_${counterStr}`.length > maxLength) {
+      core.info(`   ✂️  service_tag truncated to fit max_length=${maxLength}`);
+    }
     serviceTags.set(service.name, serviceTag);
 
     for (const env of serviceEnvs) {
       core.info(`\n🔧 Creating entry for ${service.name} (counter: ${nextCounter}):`);
-      const entry = createDeploymentEntry(service, env, tag, serviceRepo, serviceTag);
+      const entry = createDeploymentEntry(service, env, tag, serviceRepo, serviceTag, forceDeploy);
       matrix.addEntry(entry);
     }
   }
@@ -30621,9 +30746,10 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
  * @param {string} tag - Image tag
  * @param {string} serviceRepo - Source repository
  * @param {string} serviceTag - Pre-computed service tag (one per service)
+ * @param {boolean} [forceDeploy=false] - When true, auto_deploy is forced to 'true' regardless of env.autoDeploy
  * @returns {DeploymentEntry}
  */
-function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag) {
+function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag, forceDeploy = false) {
 
   // Log where each value comes from
   core.info(`   service_name: "${service.name}" (from skyhook.yaml services[].name)`);
@@ -30637,9 +30763,14 @@ function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag) {
   core.info(`   cloud_provider: "${env.cloudProvider || ''}" (from skyhook.yaml environments[].cloudProvider)`);
   core.info(`   namespace: "${env.namespace || ''}" (from skyhook.yaml environments[].namespace)`);
   core.info(`   account: "${env.account || ''}" (from skyhook.yaml environments[].account)`);
-  const autoDeploy = env.autoDeploy === true ? 'true' : 'false';
-  core.info(`   auto_deploy: "${autoDeploy}" (from skyhook.yaml environments[].autoDeploy, defaults to false if not set)`);
-  core.info(`   service_tag: "${serviceTag}" (computed: {service_name}_{tag}_{counter})`);
+  const intrinsicAutoDeploy = env.autoDeploy === true ? 'true' : 'false';
+  const autoDeploy = forceDeploy ? 'true' : intrinsicAutoDeploy;
+  if (forceDeploy && intrinsicAutoDeploy !== 'true') {
+    core.info(`   auto_deploy: "${autoDeploy}" (forced by force-deploy=true; intrinsic was "${intrinsicAutoDeploy}")`);
+  } else {
+    core.info(`   auto_deploy: "${autoDeploy}" (from skyhook.yaml environments[].autoDeploy, defaults to false if not set)`);
+  }
+  core.info(`   service_tag: "${serviceTag}" (computed: {service_name}_{tag}_{counter}, length-aware to fit max-length)`);
 
   return new DeploymentEntry({
     service_name: service.name,
@@ -32605,12 +32736,15 @@ const { DeploymentMatrix } = __nccwpck_require__(9439);
 const { detectConfigFormats } = __nccwpck_require__(7771);
 const { parseSkyhookConfig } = __nccwpck_require__(7396);
 const { buildMatrixFromSkyhook, mergeMatrices } = __nccwpck_require__(6104);
+const { buildServiceTagPrefix } = __nccwpck_require__(5280);
 const { buildBuildMatrix } = __nccwpck_require__(3959);
 const { resolveServiceEnvironments } = __nccwpck_require__(9315);
 
 async function run() {
   try {
     const overlay = core.getInput('overlay');
+    const environmentsInput = core.getInput('environments');
+    const forceDeploy = core.getInput('force-deploy') === 'true';
     const rawBranch = core.getInput('branch') || '';
     // Treat "HEAD" as empty so git clone uses the remote's default branch
     const branch = rawBranch === 'HEAD' ? '' : rawBranch;
@@ -32618,6 +32752,38 @@ async function run() {
     const repoPath = core.getInput('repo-path') || '.';
     const onDiscoveryFailure = core.getInput('on-discovery-failure') || 'skip';
     const kustomizeImageFallback = core.getInput('kustomize-image-fallback') === 'true';
+    const maxLengthRaw = core.getInput('max-length') || '63';
+    if (!/^[0-9]+$/.test(maxLengthRaw)) {
+      throw new Error(`max-length must be a positive integer, got "${maxLengthRaw}"`);
+    }
+    const maxLength = parseInt(maxLengthRaw, 10);
+    if (!Number.isFinite(maxLength) || maxLength <= 0) {
+      throw new Error(`max-length must be a positive integer, got "${maxLengthRaw}"`);
+    }
+
+    // Build effective env filter: "environments" wins if non-empty, else fall back to legacy "overlay".
+    // null means no filter (include all environments).
+    const envList = environmentsInput
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    let envFilterSet = null;
+    if (envList.length > 0) {
+      envFilterSet = new Set(envList);
+      if (overlay) {
+        core.info(`Both "environments" and "overlay" provided - using "environments". environments=[${envList.join(', ')}], overlay="${overlay}"`);
+      } else {
+        core.info(`Using environments filter: [${envList.join(', ')}]`);
+      }
+    } else if (overlay) {
+      envFilterSet = new Set([overlay]);
+      core.info(`Using overlay filter: "${overlay}"`);
+    } else {
+      core.info('No env filter set - all environments included');
+    }
+    if (forceDeploy) {
+      core.info('force-deploy=true: all matched envs will be treated as auto_deploy=true');
+    }
 
     // Collect all available tokens (deduplicated, ordered by priority)
     const inputToken = core.getInput('github-token');
@@ -32658,7 +32824,7 @@ async function run() {
     // Process Koala config if present
     if (configFormats.hasKoala) {
       core.info('📋 Processing Koala configuration (.koala-monorepo.json)');
-      koalaMatrix = await processKoalaConfig(repoPath, branch, tag, githubToken, overlay);
+      koalaMatrix = await processKoalaConfig(repoPath, branch, tag, githubToken, envFilterSet, forceDeploy);
     }
 
     // Log git credential config for debugging — actions/checkout may set a credential helper
@@ -32682,7 +32848,7 @@ async function run() {
     const serviceCounters = koalaMatrix ? getServiceCounters(koalaMatrix) : new Map();
     if (configFormats.hasSkyhook) {
       core.info('📋 Processing Skyhook configuration (.skyhook/skyhook.yaml)');
-      skyhookMatrix = await processSkyhookConfig(configFormats.skyhookPath, tag, overlay, repoPath, serviceCounters, branch, githubTokens, skyhookCloneCache, onDiscoveryFailure);
+      skyhookMatrix = await processSkyhookConfig(configFormats.skyhookPath, tag, envFilterSet, repoPath, serviceCounters, branch, githubTokens, skyhookCloneCache, onDiscoveryFailure, forceDeploy, maxLength);
     }
 
     // Determine final matrix
@@ -32764,8 +32930,14 @@ function getServiceCounters(matrix) {
 
 /**
  * Process Koala configuration using workflow-utils CLI
+ * @param {string} repoPath
+ * @param {string} branch
+ * @param {string} tag
+ * @param {string} githubToken
+ * @param {Set<string>|null} envFilterSet - Effective env filter (null = all envs)
+ * @param {boolean} forceDeploy - When true, override auto_deploy to 'true' for all surviving entries
  */
-async function processKoalaConfig(repoPath, branch, tag, githubToken, overlay) {
+async function processKoalaConfig(repoPath, branch, tag, githubToken, envFilterSet, forceDeploy) {
   core.info('🔍 Reading .koala-monorepo.json from repo root to identify services');
   core.info('📋 Extracting deployment configuration from .koala.toml files for different environments');
 
@@ -32775,9 +32947,19 @@ async function processKoalaConfig(repoPath, branch, tag, githubToken, overlay) {
     cmd += ` -branch ${branch}`;
   }
 
-  if (overlay) {
-    core.info(`🎯 Filtering for environment: ${overlay}`);
-    cmd += ` -envFilter ${overlay}`;
+  // workflow-utils -envFilter takes a single value. If we have exactly one env in the filter,
+  // use the native flag (also faster - drops other envs server-side). Otherwise, fetch all
+  // envs and post-filter the parsed matrix below.
+  let postFilterNeeded = false;
+  if (envFilterSet instanceof Set && envFilterSet.size > 0) {
+    if (envFilterSet.size === 1) {
+      const single = [...envFilterSet][0];
+      core.info(`🎯 Filtering for environment: ${single}`);
+      cmd += ` -envFilter ${single}`;
+    } else {
+      core.info(`🎯 Filtering for environments (post-filter): [${[...envFilterSet].join(', ')}]`);
+      postFilterNeeded = true;
+    }
   } else {
     core.info('🌍 Including all environments');
   }
@@ -32822,22 +33004,40 @@ async function processKoalaConfig(repoPath, branch, tag, githubToken, overlay) {
     parsed = JSON.parse(parsed);
   }
 
-  return DeploymentMatrix.fromObject(parsed);
+  const matrix = DeploymentMatrix.fromObject(parsed);
+
+  // Post-filter by env name set when workflow-utils couldn't do it natively (multi-env).
+  if (postFilterNeeded) {
+    const before = matrix.include.length;
+    matrix.include = matrix.include.filter(e => envFilterSet.has(e.overlay));
+    core.info(`Post-filtered Koala matrix by environments: ${before} → ${matrix.include.length} entries`);
+  }
+
+  // force-deploy: override auto_deploy on every surviving entry.
+  if (forceDeploy) {
+    for (const entry of matrix.include) {
+      entry.auto_deploy = 'true';
+    }
+    core.info(`force-deploy: overrode auto_deploy='true' on ${matrix.include.length} Koala entries`);
+  }
+
+  return matrix;
 }
 
 /**
  * Process Skyhook configuration
  * @param {string} skyhookPath - Path to skyhook.yaml
  * @param {string} tag - Image tag
- * @param {string} overlay - Environment filter
+ * @param {Set<string>|null} envFilterSet - Effective env filter (null = all envs)
  * @param {string} repoPath - Path to the git repository
  * @param {Map<string, number>} serviceCounters - Per-service counters from Koala
  * @param {string} branch - Branch for deployment repo cloning
  * @param {string[]} githubTokens - GitHub tokens to try for deployment repo access (in priority order)
  * @param {Map<string, string>} cloneCache - Shared clone cache (populated during resolution, reused for image extraction)
  * @param {string} onDiscoveryFailure - Strategy for clone failures: 'fail' or 'skip'
+ * @param {boolean} forceDeploy - When true, override auto_deploy to 'true' on every surviving entry
  */
-async function processSkyhookConfig(skyhookPath, tag, overlay, repoPath, serviceCounters, branch, githubTokens, cloneCache, onDiscoveryFailure) {
+async function processSkyhookConfig(skyhookPath, tag, envFilterSet, repoPath, serviceCounters, branch, githubTokens, cloneCache, onDiscoveryFailure, forceDeploy, maxLength = 63) {
   const config = parseSkyhookConfig(skyhookPath);
 
   core.info(`Found ${config.services.length} services and ${config.environments.length} environments in Skyhook config`);
@@ -32847,7 +33047,7 @@ async function processSkyhookConfig(skyhookPath, tag, overlay, repoPath, service
 
   // Query existing git tags to find highest counters per service,
   // so we don't generate duplicate tags across runs on the same day.
-  const existingCounters = await getExistingTagCounters(config.services, tag, repoPath);
+  const existingCounters = await getExistingTagCounters(config.services, tag, repoPath, maxLength);
 
   // Merge: take the highest counter from either source
   const mergedCounters = new Map(serviceCounters);
@@ -32891,9 +33091,11 @@ async function processSkyhookConfig(skyhookPath, tag, overlay, repoPath, service
   const matrix = buildMatrixFromSkyhook(eligibleServices, config.environments, {
     tag,
     serviceRepo,
-    envFilter: overlay,
+    envFilterSet,
     serviceCounters: mergedCounters,
-    perServiceEnvs
+    perServiceEnvs,
+    forceDeploy,
+    maxLength,
   });
 
   return matrix;
@@ -32902,12 +33104,20 @@ async function processSkyhookConfig(skyhookPath, tag, overlay, repoPath, service
 /**
  * Query existing git tags to find the highest counter per service for the given tag base.
  * Looks for tags matching {service_name}_{tag}_NN and returns the highest NN per service.
+ *
+ * The lookup MUST use the same truncation rules buildServiceTag applies when
+ * minting new tags. Otherwise truncated tags from prior runs will not match
+ * the regex, the counter will reset to 0, and the next run will collide with
+ * an existing release. The counter capture is also widened from \d{2} to \d+
+ * so 3+ digit counters round-trip correctly.
+ *
  * @param {Array} services - Array of service configurations
  * @param {string} tag - Base image tag (e.g., "main_2026-03-12")
  * @param {string} repoPath - Path to the git repository
+ * @param {number} [maxLength=63] - Same max-length used by buildServiceTag.
  * @returns {Promise<Map<string, number>>} - Map of service_name -> highest counter
  */
-async function getExistingTagCounters(services, tag, repoPath) {
+async function getExistingTagCounters(services, tag, repoPath, maxLength = 63) {
   const counters = new Map();
 
   let stdout = '';
@@ -32927,8 +33137,11 @@ async function getExistingTagCounters(services, tag, repoPath) {
   }
 
   for (const service of services) {
-    // Match tags like: refs/tags/{service_name}_{tag}_NN
-    const pattern = new RegExp(`refs/tags/${escapeRegExp(service.name)}_${escapeRegExp(tag)}_(\\d{2})$`, 'm');
+    // Compute the same prefix buildServiceTag would emit for this service+tag
+    // so we find prior tags whether they were truncated or not. Counter capture
+    // is \d+ to handle 2-digit and overflow (3+ digit) counters.
+    const prefix = buildServiceTagPrefix(service.name, tag, maxLength);
+    const pattern = new RegExp(`refs/tags/${escapeRegExp(prefix)}_(\\d+)$`, 'm');
     let highest = -1;
 
     for (const line of stdout.split('\n')) {

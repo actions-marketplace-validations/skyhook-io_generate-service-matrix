@@ -1,5 +1,6 @@
 const core = require('@actions/core');
 const { DeploymentMatrix, DeploymentEntry } = require('../DeploymentMatrix');
+const { buildServiceTag } = require('./build-service-tag');
 
 /**
  * Build a DeploymentMatrix from Skyhook services and environments
@@ -8,14 +9,18 @@ const { DeploymentMatrix, DeploymentEntry } = require('../DeploymentMatrix');
  * @param {Object} options - Build options
  * @param {string} options.tag - Image tag to inject
  * @param {string} options.serviceRepo - Source repository (e.g., "KoalaOps/orbit")
- * @param {string} [options.envFilter] - Environment filter (optional)
+ * @param {Set<string>|null} [options.envFilterSet] - Environment filter as a set of names. null/empty = no filter.
  * @param {Map<string, number>} [options.serviceCounters] - Per-service counters from Koala
  * @param {Map<string, Array>} [options.perServiceEnvs] - Per-service environments from deployment repos
+ * @param {boolean} [options.forceDeploy] - When true, auto_deploy is set to 'true' on every surviving entry regardless of env.autoDeploy
  * @returns {DeploymentMatrix}
  */
 function buildMatrixFromSkyhook(services, environments, options = {}) {
-  const { tag, serviceRepo, envFilter, serviceCounters = new Map(), perServiceEnvs = new Map() } = options;
+  const { tag, serviceRepo, envFilterSet, serviceCounters = new Map(), perServiceEnvs = new Map(), forceDeploy = false, maxLength = 63 } = options;
   const matrix = new DeploymentMatrix();
+
+  // null/empty set means no filter (include all envs).
+  const effectiveFilter = (envFilterSet instanceof Set && envFilterSet.size > 0) ? envFilterSet : null;
 
   // Clone the counters map so we can modify it
   const counters = new Map(serviceCounters);
@@ -24,6 +29,8 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
   core.info(`   - Tag: ${tag}`);
   core.info(`   - Service repo (from GITHUB_REPOSITORY): ${serviceRepo}`);
   core.info(`   - Existing service counters: ${JSON.stringify(Object.fromEntries(counters))}`);
+  core.info(`   - Env filter: ${effectiveFilter ? `[${[...effectiveFilter].join(', ')}]` : '(none)'}`);
+  core.info(`   - force-deploy: ${forceDeploy}`);
 
   core.info(`   - Services count: ${services.length}`);
 
@@ -36,8 +43,8 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
     let serviceEnvs = perServiceEnvs.has(service.name) ? perServiceEnvs.get(service.name) : environments;
 
     // Apply environment filter if provided
-    if (envFilter) {
-      serviceEnvs = serviceEnvs.filter(env => env.name === envFilter);
+    if (effectiveFilter) {
+      serviceEnvs = serviceEnvs.filter(env => effectiveFilter.has(env.name));
     }
 
     core.info(`   - ${service.name}: ${serviceEnvs.length} environments${perServiceEnvs.has(service.name) ? ' (from deployment repo)' : ' (from local config)'}`);
@@ -47,12 +54,19 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
     const nextCounter = currentCounter + 1;
     counters.set(service.name, nextCounter);
     const counterStr = String(nextCounter).padStart(2, '0');
-    const serviceTag = `${service.name}_${tag}_${counterStr}`;
+    // Length-aware composition: protects service prefix and counter suffix,
+    // trims the elastic tag middle so the final tag fits within maxLength
+    // (default 63 = K8s label limit) without trailing or double separators.
+    // See src/matrix/build-service-tag.js for the invariants.
+    const serviceTag = buildServiceTag(service.name, tag, counterStr, maxLength);
+    if (serviceTag.length === maxLength && `${service.name}_${tag}_${counterStr}`.length > maxLength) {
+      core.info(`   ✂️  service_tag truncated to fit max_length=${maxLength}`);
+    }
     serviceTags.set(service.name, serviceTag);
 
     for (const env of serviceEnvs) {
       core.info(`\n🔧 Creating entry for ${service.name} (counter: ${nextCounter}):`);
-      const entry = createDeploymentEntry(service, env, tag, serviceRepo, serviceTag);
+      const entry = createDeploymentEntry(service, env, tag, serviceRepo, serviceTag, forceDeploy);
       matrix.addEntry(entry);
     }
   }
@@ -69,9 +83,10 @@ function buildMatrixFromSkyhook(services, environments, options = {}) {
  * @param {string} tag - Image tag
  * @param {string} serviceRepo - Source repository
  * @param {string} serviceTag - Pre-computed service tag (one per service)
+ * @param {boolean} [forceDeploy=false] - When true, auto_deploy is forced to 'true' regardless of env.autoDeploy
  * @returns {DeploymentEntry}
  */
-function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag) {
+function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag, forceDeploy = false) {
 
   // Log where each value comes from
   core.info(`   service_name: "${service.name}" (from skyhook.yaml services[].name)`);
@@ -85,9 +100,14 @@ function createDeploymentEntry(service, env, tag, serviceRepo, serviceTag) {
   core.info(`   cloud_provider: "${env.cloudProvider || ''}" (from skyhook.yaml environments[].cloudProvider)`);
   core.info(`   namespace: "${env.namespace || ''}" (from skyhook.yaml environments[].namespace)`);
   core.info(`   account: "${env.account || ''}" (from skyhook.yaml environments[].account)`);
-  const autoDeploy = env.autoDeploy === true ? 'true' : 'false';
-  core.info(`   auto_deploy: "${autoDeploy}" (from skyhook.yaml environments[].autoDeploy, defaults to false if not set)`);
-  core.info(`   service_tag: "${serviceTag}" (computed: {service_name}_{tag}_{counter})`);
+  const intrinsicAutoDeploy = env.autoDeploy === true ? 'true' : 'false';
+  const autoDeploy = forceDeploy ? 'true' : intrinsicAutoDeploy;
+  if (forceDeploy && intrinsicAutoDeploy !== 'true') {
+    core.info(`   auto_deploy: "${autoDeploy}" (forced by force-deploy=true; intrinsic was "${intrinsicAutoDeploy}")`);
+  } else {
+    core.info(`   auto_deploy: "${autoDeploy}" (from skyhook.yaml environments[].autoDeploy, defaults to false if not set)`);
+  }
+  core.info(`   service_tag: "${serviceTag}" (computed: {service_name}_{tag}_{counter}, length-aware to fit max-length)`);
 
   return new DeploymentEntry({
     service_name: service.name,
